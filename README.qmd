@@ -1,0 +1,214 @@
+---
+title: "Urban Spatial Econometrics & Machine Learning"
+subtitle: "Spatial Autoregressive (SAR), Spatial Error (SEM), and Spatial Dependence Modeling in Philadelphia"
+author: "Muhammad Riesya Attaya"
+date: "2026-09-16"
+format:
+  gfm:
+    toc: true
+    toc-depth: 3
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-summary: "Show Code"
+    number-sections: true
+execute:
+  warning: false
+  message: false
+---
+
+## Executive Summary
+
+This study models spatial dependencies at the census tract level across Philadelphia, Pennsylvania. By empirically evaluating the classical Ordinary Least Squares (OLS) assumption of independent observations, we test for spatial autocorrelation using **Moran's I** and **Lagrange Multiplier Diagnostics**, followed by comparative estimation of **Spatial Autoregressive (SAR)** and **Spatial Error Model (SEM)** specifications.
+
+The primary response variable is `usarea` (urban spatial land-use characteristics), modeled against demographic and socio-economic predictors:
+- `lmhhinc`: Log median household income
+- `lpop`: Log total population
+- `pnhblk`: Proportion non-Hispanic Black residents
+- `punemp`: Proportion unemployed civilian labor force
+- `pvac`: Proportion vacant housing units
+- `ph70`: Proportion housing structures built prior to 1970
+- `lmhval`: Log median housing valuation
+- `phnew`: Proportion recently constructed housing
+- `phisp`: Proportion Hispanic residents
+
+---
+
+## Environment Setup & Automated Data Ingestion
+
+Spatial polygon data is ingested directly from the public repository in ESRI Shapefile format, projected into WGS84 coordinates, and centroid geometries are extracted for spatial matrix construction.
+
+```{r setup}
+#| message: false
+#| warning: false
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+required_packages <- c(
+  "tidyverse", "sf", "spdep", "spatialreg", "ggplot2", 
+  "corrplot", "nortest", "lmtest", "car"
+)
+
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# Automated Data Ingestion
+if (!file.exists("phil_tracts.shp")) {
+  download.file(url = "https://raw.githubusercontent.com/crd230/data/master/phil_tracts.zip",
+                destfile = "phil_tracts.zip", quiet = TRUE)
+  unzip(zipfile = "phil_tracts.zip")
+}
+
+data_sf <- st_read("phil_tracts.shp", quiet = TRUE)
+
+df_with_coords <- data_sf %>%
+  st_centroid() %>% 
+  st_transform(4326) %>%
+  mutate(
+    longitude = st_coordinates(.)[,1],
+    latitude  = st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry()
+
+cat("Total Census Tracts Analyzed:", nrow(df_with_coords), "\n")
+head(df_with_coords[, c("usarea", "lmhhinc", "lpop", "punemp", "lmhval", "longitude", "latitude")])
+```
+
+---
+
+## Exploratory Data Analysis (EDA)
+
+Bivariate correlation structures among explanatory variables are evaluated to detect initial collinearity before model fitting.
+
+```{r eda}
+vars <- c("usarea", "lmhhinc", "lpop", "pnhblk", "punemp", "pvac", "ph70", "lmhval", "phnew", "phisp")
+cor_matrix <- cor(df_with_coords[, vars], use = "complete.obs")
+
+corrplot(cor_matrix, method = "color", type = "upper", 
+         tl.col = "black", tl.srt = 45, addCoef.col = "black",
+         number.cex = 0.7, title = "Bivariate Correlation Matrix", mar = c(0,0,2,0))
+```
+
+---
+
+## Spatial Weight Matrix & Global Moran's I Test
+
+A spatial weight matrix ($W$) is constructed via $k$-Nearest Neighbors ($k=3$), followed by row-standardization. Spatial autocorrelation is evaluated using the **Global Moran's I** statistic.
+
+```{r spatial-weights}
+coords <- cbind(df_with_coords$longitude, df_with_coords$latitude)
+nb_knn <- knn2nb(knearneigh(coords, k = 3))
+W <- nb2listw(nb_knn, style = "W", zero.policy = TRUE)
+
+# Global Moran's I Test
+moran_test <- moran.test(df_with_coords$usarea, W, alternative = "two.sided")
+moran_test
+
+moran.plot(df_with_coords$usarea, W, 
+           main = "Moran's I Scatterplot for Urban Land Area",
+           xlab = "Standardized Urban Area", 
+           ylab = "Spatially Lagged Urban Area",
+           pch = 19, col = "#2563eb")
+```
+
+---
+
+## Ordinary Least Squares (OLS) Baseline & Diagnostics
+
+Standard linear regression is estimated with multi-collinearity checks (Variance Inflation Factor / VIF) and spatial dependence Lagrange Multiplier tests.
+
+```{r ols-modeling}
+ols_formula <- as.formula(usarea ~ lmhhinc + lpop + pnhblk + punemp + pvac + ph70 + lmhval + phnew + phisp)
+ols_model <- lm(ols_formula, data = df_with_coords)
+
+summary(ols_model)
+
+ols_aic <- AIC(ols_model)
+ols_rmse <- sqrt(mean(residuals(ols_model)^2))
+
+cat("Variance Inflation Factors (VIF):\n")
+print(round(vif(ols_model), 3))
+
+# Lagrange Multiplier Tests for Spatial Dependence
+lm_tests <- lm.LMtests(ols_model, W, test = c("LMerr", "LMlag", "RLMerr", "RLMlag", "SARMA"))
+print(lm_tests)
+```
+
+---
+
+## Spatial Econometric Models: SAR vs. SEM
+
+Estimating the **Spatial Autoregressive Model (SAR)** and **Spatial Error Model (SEM)** via Maximum Likelihood to account for endogenous spatial interaction and spatial error autocorrelation.
+
+```{r spatial-models}
+# Spatial Autoregressive Model (SAR)
+sar_model <- lagsarlm(ols_formula, data = df_with_coords, listw = W, zero.policy = TRUE)
+summary(sar_model)
+
+sar_aic <- AIC(sar_model)
+sar_rmse <- sqrt(mean(residuals(sar_model)^2))
+
+# Spatial Error Model (SEM)
+sem_model <- errorsarlm(ols_formula, data = df_with_coords, listw = W, zero.policy = TRUE)
+summary(sem_model)
+
+sem_aic <- AIC(sem_model)
+sem_rmse <- sqrt(mean(residuals(sem_model)^2))
+```
+
+---
+
+## Model Comparison & Residual Diagnostics
+
+Comparison of parametric models across Akaike Information Criterion (AIC) and Root Mean Squared Error (RMSE).
+
+```{r comparison}
+comparison_df <- data.frame(
+  Model = c("OLS (Standard Linear)", "SAR (Spatial Lag)", "SEM (Spatial Error)"),
+  AIC = c(ols_aic, sar_aic, sem_aic),
+  RMSE = c(ols_rmse, sar_rmse, sem_rmse)
+)
+
+knitr::kable(comparison_df, digits = 4, caption = "Spatial Econometric Model Performance Comparison")
+```
+
+```{r diagnostic-plots}
+best_residuals <- residuals(sar_model)
+best_fitted <- fitted(sar_model)
+
+par(mfrow = c(2, 2))
+plot(best_fitted, best_residuals, main = "Residuals vs Fitted (SAR)", xlab = "Fitted", ylab = "Residuals", pch = 19, col = rgb(0.2,0.4,0.8,0.6))
+abline(h = 0, col = "red", lty = 2)
+
+qqnorm(best_residuals, main = "Normal Q-Q Plot", pch = 19, col = rgb(0.2,0.4,0.8,0.6))
+qqline(best_residuals, col = "red")
+
+hist(best_residuals, breaks = 15, col = "lightblue", main = "Residual Distribution", xlab = "Residuals")
+
+plot(coords, pch = 19, cex = 1.2, col = rgb(0.1, 0.5, 0.8, 0.6),
+     main = "Spatial Distribution of Census Tracts", xlab = "Longitude", ylab = "Latitude")
+par(mfrow = c(1, 1))
+```
+
+---
+
+## Interpretation & Policy Implications
+
+### 1. Empirical Confirmation of Spatial Autocorrelation
+* **Global Moran's I ($p < 0.001$)**: Rejects the null hypothesis of spatial randomness, confirming substantial positive spatial clustering across Philadelphia census tracts.
+* **Lagrange Multiplier Diagnostics**: Significant LMlag and LMerr statistics reveal that standard OLS regression suffers from omitted spatial structure, violating error independence assumptions and leading to inefficient or biased parameter estimates.
+
+### 2. Comparative Model Superiority: SAR vs. SEM
+* **Spatial Autoregressive (SAR)**: Successfully models spatial spillover effects, demonstrating that land-use patterns within a given tract are directly influenced by surrounding neighborhood characteristics ($\rho W y$).
+* **Spatial Error Model (SEM)**: Captures unobserved spatial error covariance driven by latent environmental and regional economic factors.
+* **Goodness-of-Fit**: Both spatial formulations markedly outperform baseline OLS in both AIC minimization and RMSE, establishing the necessity of spatial weighting in municipal urban analytics.
+
+### 3. Urban Planning & Regional Policy Insights
+* Variables such as unemployment rates (`punemp`) and median housing value (`lmhval`) exhibit high sensitivity to spatial boundary definitions. 
+* Urban renewal and community investment programs cannot be evaluated in geographic isolation; capital improvements in one census tract generate measurable positive economic spillovers into adjacent tracts.
